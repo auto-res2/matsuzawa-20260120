@@ -1712,5 +1712,53 @@
     "experimental_code": "import torch, torch.nn.functional as F\n\ndef stvm_lapshot(feat_s, y_s, feat_q, eps=1e-4, iters_max=50):\n    # Step 1  prototypes\n    classes = torch.unique(y_s)\n    protos  = torch.stack([feat_s[y_s==c].mean(0) for c in classes])\n    C = len(classes)\n\n    # Step 2  bootstrap Hard nearest-prototype labels\n    dist_q = torch.cdist(feat_q, protos)\n    y_boot = dist_q.argmin(1)\n\n    # Step 3  build virtual nodes by class-aware mixup\n    q_norm = F.normalize(feat_q, dim=1)\n    cos = q_norm @ q_norm.T\n    virt = []\n    for c in range(C):\n        idx = (y_boot==c).nonzero().squeeze()\n        if idx.numel()<2: continue\n        cos_c = cos[idx][:,idx]\n        thresh = cos_c.median()\n        pairs = (cos_c >= thresh).nonzero(as_tuple=False)\n        for i,j in pairs:\n            if i<j:  # avoid duplicates\n                virt.append(0.5*feat_q[idx[i]] + 0.5*feat_q[idx[j]])\n        # proto–query mixup\n        k = idx[dist_q[idx,c].argmin()]\n        virt.append(0.5*protos[c] + 0.5*feat_q[k])\n    if virt:\n        feat_v = torch.stack(virt)\n        feat = torch.cat([feat_q, feat_v],0)\n    else:\n        feat = feat_q.clone()\n    n_total = len(feat)\n\n    # Step 5  self-tuning affinity\n    k = max(1, int(torch.log2(torch.tensor(n_total))))\n    dist = torch.cdist(feat, feat)\n    _, nn_idx = dist.topk(k+1, largest=False)   # +self\n    sigma = dist[torch.arange(n_total), nn_idx[:,k]] + 1e-8\n    W = torch.zeros(n_total, n_total, device=feat.device)\n    for i in range(n_total):\n        nbrs = nn_idx[i,1:]\n        w = torch.exp(- dist[i,nbrs] / (sigma[i]*sigma[nbrs]))\n        W[i, nbrs] = w\n    W = (W+W.T)/2\n    Dinv = 1/(W.sum(1)+1e-8)\n\n    # Step 6  density-adaptive lambdas\n    d = torch.cdist(feat, protos).min(1).values\n    lam = torch.exp(- d.pow(2) / (2*d.median()**2))\n\n    # Pre-compute a_i for all nodes\n    a = torch.cdist(feat, protos).pow(2)\n    y = F.softmax(-a, dim=1)\n\n    for _ in range(iters_max):\n        y_new = F.softmax(-a + (lam*Dinv).unsqueeze(1) * (W @ y), dim=1)\n        if (y_new - y).abs().max() < eps:\n            break\n        y = y_new\n\n    # return predictions for *original* queries\n    return y[:len(feat_q)].argmax(1)",
     "expected_result": "miniImageNet 5-way 1-shot (ResNet-18 embeddings)\nSimpleShot………………………………64.2 ± 0.2\nLaplacianShot (tuned)……………70.0 ± 0.2\nSTDA-LapShot……………………………72.4 ± 0.2\nSTVM-LapShot (ours)………………73.9 ± 0.2  (+1.5 over STDA, +3.9 over tuned LapShot)\nRandom-noise nodes………………71.9 ± 0.2  (shows benefit of label-aware mixup)\n\nCross-domain mini→CUB 1-shot\nLaplacianShot…………………………57.8\nSTDA-LapShot…………………………59.6\nSTVM-LapShot…………………………61.9  (+2.3)\n\nComputation: graph size ↑1.6× on average; wall-clock inference ↑35 % but still <30 ms/episode on RTX-3090; zero hyper-parameter tuning.\nAcross eight evaluated splits, average gain over STDA-LapShot is +1.5 pp (1-shot) / +0.8 pp (5-shot) accuracy.",
     "expected_conclusion": "By augmenting the transductive graph with automatically generated, label-aware virtual queries, STVM-LapShot overcomes the manifold sparsity that limits existing parameter-free Laplacian classifiers. The method is: (1) novel—no prior few-shot learner creates synthetic *unlabelled* nodes at inference time; (2) fully automatic—retains zero hyper-parameters by deriving all thresholds from episode statistics; and (3) effective—delivering an extra +1.5 pp accuracy in standard settings and +2 pp under domain shift while keeping computation lightweight. Academically, it bridges ideas from mixup augmentation and graph-based SSL, suggesting a new research direction of inference-time latent-space densification. Practically, it further simplifies real-world low-shot deployment: users supply only support labels, and the algorithm self-tunes both regularization strengths and manifold density, requiring no validation data or retraining."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: Evaluate few-shot image classification on standard 5-way 1-/5-shot episodes. The experiment compares the new inference-time graph-based classifier \"Self-Tuning Virtual-Mixup LaplacianShot (STVM-LapShot)\" against the strongest parameter-free baseline \"STDA-LapShot\".\nWorkflow: 1) Extract embeddings for each episode with a fixed backbone (ResNet-18 pretrained on base classes). 2) For each episode, apply either STVM-LapShot or the baseline to support + query features to obtain query labels. 3) Aggregate episode-level accuracies across 10 000 episodes. 4) Report mean accuracy, 95 % confidence interval, and average wall-clock inference time per episode.\nResource fit: The whole procedure is inference-only, processes ≤75 query+support+virtual nodes per episode (<0.5 MB), and parallelises easily; running 10 000 episodes on a single A100 uses <1 GB VRAM and <30 min wall time, well within the provided gpu-runner limits.",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA A100 or H200, VRAM: 80 GB or more, RAM: 2048 GB or more"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Correctness criteria: a prediction for an episode’s query image is correct if the predicted class index equals the ground-truth label.\nCalculation: accuracy = (number of correct query predictions across all episodes) / (total number of query predictions). For 5-way episodes with 15 queries per class, denominator = 75 × number_of_episodes.\nTask appropriateness: Few-shot classification is a discrete closed-set problem; accuracy directly reflects the proportion of images classified correctly and is the community-standard metric.\nVisualisations: 1) Bar chart of mean accuracy for each method with error bars (95 % CI). 2) Optional confusion matrix averaged over all episodes."
+      },
+      {
+        "name": "95% confidence interval",
+        "description": "Correctness criteria: Same as accuracy; the CI measures statistical uncertainty, not prediction correctness.\nCalculation: For mean accuracy \\hat p over N episodes, CI = 1.96 × sqrt( \\hat p (1-\\hat p) / (N × Q) ), where Q=75 queries/episode. Report as ± value around the mean.\nTask appropriateness: Large episode sampling may still leave sampling noise; CI quantifies reliability of the reported mean.\nVisualisations: Error bars on accuracy bar plot; line plot of accuracy convergence vs. number of evaluated episodes with shaded CI."
+      },
+      {
+        "name": "average inference time",
+        "description": "Correctness criteria: Not applicable; measures performance cost.\nCalculation: For each method, record wall-clock time needed to process each episode (embedding reading + graph construction + label propagation). Average over all episodes.\nTask appropriateness: Both methods are intended for practical, rapid inference; runtime comparison is essential.\nVisualisations: Histogram of per-episode runtimes; table of mean and standard deviation."
+      }
+    ],
+    "models_to_use": [
+      "ResNet-18 (11.7 M parameters)"
+    ],
+    "datasets_to_use": [
+      "miniImageNet"
+    ],
+    "proposed_method": {
+      "method_name": "STVM-LapShot",
+      "description": "Parameter-free self-tuning LaplacianShot augmented with on-the-fly, label-aware virtual mixup that inserts extra unlabeled nodes into the affinity graph, densifying sparse manifolds and improving label propagation.",
+      "optuna_config": {
+        "enabled": false,
+        "n_trials": 0
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "STDA-LapShot",
+        "description": "Strongest existing parameter-free LaplacianShot variant that uses self-tuning affinities and per-node regularisation but no virtual node densification.",
+        "optuna_config": {
+          "enabled": false,
+          "n_trials": 0
+        }
+      }
+    ]
   }
 }
