@@ -1,0 +1,23 @@
+run_id: comparative-1-resnet18-miniImageNet
+method: STDA-LapShot
+model:
+  name: resnet18
+  pretrained: true
+  frozen: true
+  feature_dim: 512
+dataset:
+  name: miniImageNet
+  split: test
+  n_ways: 5
+  n_shots: [1, 5]
+  n_queries: 15
+  n_episodes: 10000
+  data_root: /datasets/miniimagenet
+training:
+  learning_rate: null
+  batch_size: 1  # per episode (inference only)
+  epochs: 0
+  optimizer: null
+optuna:
+  n_trials: 0
+  search_spaces: []
